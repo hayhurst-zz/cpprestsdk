@@ -4,7 +4,9 @@
  **/
 #include "stdafx.h"
 
-#if !defined(CPPREST_EXCLUDE_WEBSOCKETS) || !defined(_WIN32)
+// The asio HTTP client needs the crossplat threadpool on Windows too, not
+// only the websocket implementation.
+#if !defined(CPPREST_EXCLUDE_WEBSOCKETS) || !defined(_WIN32) || defined(CPPREST_FORCE_HTTP_CLIENT_ASIO)
 #include "pplx/threadpool.h"
 #include <boost/asio/detail/thread.hpp>
 #include <new>
@@ -37,7 +39,7 @@ static void abort_if_no_jvm()
 
 struct threadpool_impl final : crossplat::threadpool
 {
-    threadpool_impl(size_t n) : crossplat::threadpool(n), m_work(m_service)
+    threadpool_impl(size_t n) : crossplat::threadpool(n), m_work(boost::asio::make_work_guard(m_service))
     {
         for (size_t i = 0; i < n; i++)
             add_thread();
@@ -84,7 +86,9 @@ private:
     }
 
     std::vector<std::unique_ptr<boost::asio::detail::thread>> m_threads;
-    boost::asio::io_service::work m_work;
+    // executor_work_guard replaced io_context::work (removed in Boost 1.87);
+    // make_work_guard exists since Boost 1.66.
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> m_work;
 };
 
 #if defined(_WIN32)

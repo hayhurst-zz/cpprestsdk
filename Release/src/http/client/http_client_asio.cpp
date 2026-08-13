@@ -12,8 +12,6 @@
  *
  * =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
  ****/
-#define BOOST_BIND_NO_PLACEHOLDERS
-
 #include "stdafx.h"
 
 #include "../common/connection_pool_helpers.h"
@@ -28,6 +26,7 @@
 #endif
 #include <boost/algorithm/string.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/deadline_timer.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/ssl/error.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -35,6 +34,13 @@
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
+
+// Boost 1.87 removed the old resolver interface (resolver::query, the
+// iterator-form async_resolve overloads and placeholders::iterator). Resolve
+// through the results-based API; its iterator keeps the traversal and
+// default-constructed-is-end semantics the connect retry chains below rely on.
+using tcp_resolver_iterator = boost::asio::ip::tcp::resolver::results_type::iterator;
+
 
 #if defined(BOOST_NO_CXX11_SMART_PTR)
 #error "Cpp rest SDK requires c++11 smart pointer support from boost"
@@ -430,6 +436,8 @@ private:
         auto& self = *pool;
         std::weak_ptr<asio_connection_pool> weak_pool = pool;
 
+        // deadline_timer (posix_time-based) kept expires_from_now; only the
+        // chrono waitable timers lost it in Boost 1.87.
         self.m_pool_epoch_timer.expires_from_now(boost::posix_time::seconds(30));
         self.m_pool_epoch_timer.async_wait([weak_pool](const boost::system::error_code& ec) {
             if (ec)
@@ -582,18 +590,17 @@ public:
 
             m_context->m_timer.start();
 
-            tcp::resolver::query query(utility::conversions::to_utf8string(proxy_host), to_string(proxy_port));
-
             auto client = std::static_pointer_cast<asio_client>(m_context->m_http_client);
-            m_context->m_resolver.async_resolve(query,
+            m_context->m_resolver.async_resolve(utility::conversions::to_utf8string(proxy_host),
+                                                to_string(proxy_port),
                                                 boost::bind(&ssl_proxy_tunnel::handle_resolve,
                                                             shared_from_this(),
                                                             boost::asio::placeholders::error,
-                                                            boost::asio::placeholders::iterator));
+                                                            boost::asio::placeholders::results));
         }
 
     private:
-        void handle_resolve(const boost::system::error_code& ec, tcp::resolver::iterator endpoints)
+        void handle_resolve(const boost::system::error_code& ec, tcp::resolver::results_type results)
         {
             if (ec)
             {
@@ -602,6 +609,7 @@ public:
             else
             {
                 m_context->m_timer.reset();
+                auto endpoints = results.begin();
                 auto endpoint = *endpoints;
                 m_context->m_connection->async_connect(endpoint,
                                                        boost::bind(&ssl_proxy_tunnel::handle_tcp_connect,
@@ -611,7 +619,7 @@ public:
             }
         }
 
-        void handle_tcp_connect(const boost::system::error_code& ec, tcp::resolver::iterator endpoints)
+        void handle_tcp_connect(const boost::system::error_code& ec, tcp_resolver_iterator endpoints)
         {
             if (!ec)
             {
@@ -622,7 +630,7 @@ public:
                                                                  shared_from_this(),
                                                                  boost::asio::placeholders::error));
             }
-            else if (endpoints == tcp::resolver::iterator())
+            else if (endpoints == tcp_resolver_iterator())
             {
                 m_context->report_error(
                     "Failed to connect to any resolved proxy endpoint", ec, httpclient_errorcode_context::connect);
@@ -886,12 +894,12 @@ public:
                 auto tcp_host = proxy_type == http_proxy_type::http ? proxy_host : host;
                 auto tcp_port = proxy_type == http_proxy_type::http ? proxy_port : port;
 
-                tcp::resolver::query query(tcp_host, to_string(tcp_port));
-                ctx->m_resolver.async_resolve(query,
+                ctx->m_resolver.async_resolve(tcp_host,
+                                              to_string(tcp_port),
                                               boost::bind(&asio_context::handle_resolve,
                                                           ctx,
                                                           boost::asio::placeholders::error,
-                                                          boost::asio::placeholders::iterator));
+                                                          boost::asio::placeholders::results));
             }
 
             // Register for notification on cancellation to abort this request.
@@ -1007,7 +1015,7 @@ private:
         request_context::report_error(errorcodeValue, message);
     }
 
-    void handle_connect(const boost::system::error_code& ec, tcp::resolver::iterator endpoints)
+    void handle_connect(const boost::system::error_code& ec, tcp_resolver_iterator endpoints)
     {
         m_timer.reset();
         if (!ec)
@@ -1020,7 +1028,7 @@ private:
         {
             report_error("Request canceled by user.", ec, httpclient_errorcode_context::connect);
         }
-        else if (endpoints == tcp::resolver::iterator())
+        else if (endpoints == tcp_resolver_iterator())
         {
             report_error("Failed to connect to any resolved endpoint", ec, httpclient_errorcode_context::connect);
         }
@@ -1046,19 +1054,20 @@ private:
         }
     }
 
-    void handle_resolve(const boost::system::error_code& ec, tcp::resolver::iterator endpoints)
+    void handle_resolve(const boost::system::error_code& ec, tcp::resolver::results_type results)
     {
         if (ec)
         {
             report_error("Error resolving address", ec, httpclient_errorcode_context::connect);
         }
-        else if (endpoints == tcp::resolver::iterator())
+        else if (results.empty())
         {
             report_error("Failed to resolve address", ec, httpclient_errorcode_context::connect);
         }
         else
         {
             m_timer.reset();
+            auto endpoints = results.begin();
             auto endpoint = *endpoints;
             m_connection->async_connect(
                 endpoint,
@@ -1135,8 +1144,10 @@ private:
         }
 #endif // CPPREST_PLATFORM_ASIO_CERT_VERIFICATION_AVAILABLE
 
-        boost::asio::ssl::rfc2818_verification rfc2818(m_connection->cn_hostname());
-        return rfc2818(preverified, verifyCtx);
+        // host_name_verification replaced rfc2818_verification (removed in
+        // Boost 1.87); it exists since Boost 1.73.
+        boost::asio::ssl::host_name_verification hostVerification(m_connection->cn_hostname());
+        return hostVerification(preverified, verifyCtx);
     }
 
     void handle_write_headers(const boost::system::error_code& ec)
@@ -1183,8 +1194,8 @@ private:
 
         const auto& chunkSize = m_http_client->client_config().chunksize();
         auto readbuf = _get_readbuffer();
-        uint8_t* buf = boost::asio::buffer_cast<uint8_t*>(
-            m_body_buf.prepare(chunkSize + http::details::chunked_encoding::additional_encoding_space));
+        uint8_t* buf = static_cast<uint8_t*>(
+            m_body_buf.prepare(chunkSize + http::details::chunked_encoding::additional_encoding_space).data());
         const auto this_request = shared_from_this();
         readbuf.getn(buf + http::details::chunked_encoding::data_offset, chunkSize)
             .then([this_request, buf, chunkSize AND_CAPTURE_MEMBER_FUNCTION_POINTERS](pplx::task<size_t> op) {
@@ -1248,7 +1259,7 @@ private:
         const auto readSize = static_cast<size_t>((std::min)(
             static_cast<uint64_t>(m_http_client->client_config().chunksize()), m_content_length - m_uploaded));
         auto readbuf = _get_readbuffer();
-        readbuf.getn(boost::asio::buffer_cast<uint8_t*>(m_body_buf.prepare(readSize)), readSize)
+        readbuf.getn(static_cast<uint8_t*>(m_body_buf.prepare(readSize).data()), readSize)
             .then([this_request AND_CAPTURE_MEMBER_FUNCTION_POINTERS](pplx::task<size_t> op) {
                 try
                 {
@@ -1640,7 +1651,7 @@ private:
                     std::vector<uint8_t> decompressed;
 
                     bool boo =
-                        decompress(boost::asio::buffer_cast<const uint8_t*>(m_body_buf.data()), to_read, decompressed);
+                        decompress(static_cast<const uint8_t*>(m_body_buf.data().data()), to_read, decompressed);
                     if (!boo)
                     {
                         report_exception(std::runtime_error("Failed to decompress the response body"));
@@ -1688,7 +1699,7 @@ private:
                 }
                 else
                 {
-                    writeBuffer.putn_nocopy(boost::asio::buffer_cast<const uint8_t*>(m_body_buf.data()), to_read)
+                    writeBuffer.putn_nocopy(static_cast<const uint8_t*>(m_body_buf.data().data()), to_read)
                         .then([this_request, to_read AND_CAPTURE_MEMBER_FUNCTION_POINTERS](pplx::task<size_t> op) {
                             try
                             {
@@ -1760,7 +1771,7 @@ private:
                 std::vector<uint8_t> decompressed;
 
                 bool boo =
-                    decompress(boost::asio::buffer_cast<const uint8_t*>(m_body_buf.data()), read_size, decompressed);
+                    decompress(static_cast<const uint8_t*>(m_body_buf.data().data()), read_size, decompressed);
                 if (!boo)
                 {
                     this_request->report_exception(std::runtime_error("Failed to decompress the response body"));
@@ -1822,7 +1833,7 @@ private:
             }
             else
             {
-                writeBuffer.putn_nocopy(boost::asio::buffer_cast<const uint8_t*>(m_body_buf.data()), read_size)
+                writeBuffer.putn_nocopy(static_cast<const uint8_t*>(m_body_buf.data().data()), read_size)
                     .then([this_request AND_CAPTURE_MEMBER_FUNCTION_POINTERS](pplx::task<size_t> op) {
                         size_t writtenSize = 0;
                         try
@@ -1871,7 +1882,7 @@ private:
             assert(!m_ctx.expired());
             m_state = started;
 
-            m_timer.expires_from_now(m_duration);
+            m_timer.expires_after(m_duration);
             auto ctx = m_ctx;
             m_timer.async_wait([ctx AND_CAPTURE_MEMBER_FUNCTION_POINTERS](const boost::system::error_code& ec) {
                 handle_timeout(ec, ctx);
@@ -1882,7 +1893,7 @@ private:
         {
             assert(m_state == started || m_state == timedout);
             assert(!m_ctx.expired());
-            if (m_timer.expires_from_now(m_duration) > 0)
+            if (m_timer.expires_after(m_duration) > 0)
             {
                 // The existing handler was canceled so schedule a new one.
                 assert(m_state == started);

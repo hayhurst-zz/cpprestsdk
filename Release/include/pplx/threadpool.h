@@ -18,6 +18,13 @@
 #pragma clang diagnostic ignored "-Winfinite-recursion"
 #endif
 #include "boost/asio.hpp"
+
+// Boost 1.87 removed the io_service alias (deprecated since 1.66); restore it
+// for the pre-io_context spelling this codebase still uses.
+#include <boost/version.hpp>
+#if BOOST_VERSION >= 108700
+namespace boost { namespace asio { typedef io_context io_service; } }
+#endif
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif

@@ -95,8 +95,10 @@ bool verify_cert_chain_platform_specific(boost::asio::ssl::verify_context& verif
 #if defined(_WIN32)
     if (verify_result)
     {
-        boost::asio::ssl::rfc2818_verification rfc2818(hostName);
-        verify_result = rfc2818(verify_result, verifyCtx);
+        // host_name_verification replaced rfc2818_verification (removed in
+        // Boost 1.87); it exists since Boost 1.73.
+        boost::asio::ssl::host_name_verification hostVerification(hostName);
+        verify_result = hostVerification(verify_result, verifyCtx);
     }
 #endif
     return verify_result;
