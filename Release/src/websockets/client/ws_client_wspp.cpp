@@ -20,6 +20,7 @@
 #include "../../http/common/x509_cert_utilities.h"
 #include "pplx/threadpool.h"
 #include "ws_client_impl.h"
+#include <boost/asio/ssl/host_name_verification.hpp>
 
 // Force websocketpp to use C++ std::error_code instead of Boost.
 #define _WEBSOCKETPP_CPP11_SYSTEM_ERROR_
@@ -225,8 +226,8 @@ public:
                             verifyCtx, utility::conversions::to_utf8string(m_uri.host()));
                     }
 #endif
-                    boost::asio::ssl::rfc2818_verification rfc2818(utility::conversions::to_utf8string(m_uri.host()));
-                    return rfc2818(preverified, verifyCtx);
+                    boost::asio::ssl::host_name_verification hostVerification(utility::conversions::to_utf8string(m_uri.host()));
+                    return hostVerification(preverified, verifyCtx);
                 });
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
